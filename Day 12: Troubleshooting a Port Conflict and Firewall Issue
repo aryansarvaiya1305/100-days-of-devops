@@ -1,0 +1,439 @@
+# DevOps Day 12: Troubleshooting a Port Conflict and Firewall Issue
+
+Today’s task was a realistic Linux/DevOps troubleshooting exercise. An Apache web server on **App Server 1** was unreachable from the jump host, and the issue turned out to have **multiple layers**.
+
+Instead of assuming the network was the problem, I followed the evidence step by step:
+
+**Connectivity → Service Status → Port Conflict → Conflicting Process → Firewall → Final Verification**
+
+This exercise taught me an important production troubleshooting lesson: **fixing the first problem you discover does not always mean the entire problem is solved.**
+
+## Table of Contents
+
+* [Task Overview](#task-overview)
+* [Troubleshooting Process](#troubleshooting-process)
+
+  * [Step 1: Test Connectivity](#step-1-test-connectivity)
+  * [Step 2: Check Apache Status](#step-2-check-apache-status)
+  * [Step 3: Identify the Port Conflict](#step-3-identify-the-port-conflict)
+  * [Step 4: Find the Process Using the Port](#step-4-find-the-process-using-the-port)
+  * [Step 5: Remove the Conflict](#step-5-remove-the-conflict)
+  * [Step 6: Investigate the Firewall](#step-6-investigate-the-firewall)
+  * [Step 7: Configure iptables](#step-7-configure-iptables)
+  * [Step 8: Verify the Fix](#step-8-verify-the-fix)
+* [What I Learned](#what-i-learned)
+* [The Layered Troubleshooting Approach](#the-layered-troubleshooting-approach)
+* [Common Mistakes to Avoid](#common-mistakes-to-avoid)
+* [Commands Used](#commands-used)
+
+---
+
+## Task Overview
+
+The objective was to restore access to the Apache web server running on **App Server 1**.
+
+The Apache service was expected to be available on a specific port, such as **6400** or **5003**, but requests from the jump host were failing.
+
+The goal was to:
+
+1. Find out why Apache was unavailable.
+2. Start Apache successfully.
+3. Make sure the required port was accessible remotely.
+4. Verify the application from the jump host.
+
+---
+
+## Troubleshooting Process
+
+### Step 1: Test Connectivity
+
+I started from the jump host by testing the Apache endpoint with `curl`.
+
+```bash
+curl http://stapp01:6400
+```
+
+The response was:
+
+```text
+curl: (7) Failed to connect to stapp01 port 6400: No route to host
+```
+
+This looked like a network or firewall problem.
+
+However, before changing firewall rules, I needed to confirm that Apache was actually running.
+
+---
+
+### Step 2: Check Apache Status
+
+I connected to App Server 1:
+
+```bash
+ssh tony@stapp01
+```
+
+Then checked the Apache service:
+
+```bash
+sudo systemctl status httpd
+```
+
+Apache was in a **failed** state.
+
+This changed the direction of the investigation.
+
+The problem was not only network connectivity. The web server itself had failed to start.
+
+---
+
+### Step 3: Identify the Port Conflict
+
+The service status revealed the important error:
+
+```text
+(98)Address already in use: AH00072: make_sock: could not bind to address 0.0.0.0:6400
+```
+
+The message clearly indicated a **port binding conflict**.
+
+Apache wanted to listen on port `6400`, but another process was already using that port.
+
+Only one process can normally bind to the same IP/port combination, so Apache could not start.
+
+---
+
+### Step 4: Find the Process Using the Port
+
+To determine which application was occupying port `6400`, I used:
+
+```bash
+sudo netstat -tulpn | grep 6400
+```
+
+The result showed:
+
+```text
+tcp 0 0 127.0.0.1:6400 0.0.0.0:* LISTEN 445/sendmail: accep
+```
+
+The process using the port was:
+
+**sendmail**
+
+This was unexpected because Sendmail is an email service, not a web server.
+
+It had been configured to use the same port Apache required.
+
+---
+
+### Step 5: Remove the Conflict
+
+Once the conflicting service was identified, I stopped it:
+
+```bash
+sudo systemctl stop sendmail
+```
+
+I also disabled it so that it would not automatically start again after a reboot:
+
+```bash
+sudo systemctl disable sendmail
+```
+
+Then I started Apache:
+
+```bash
+sudo systemctl start httpd
+```
+
+Finally, I verified the service:
+
+```bash
+sudo systemctl status httpd
+```
+
+Apache was now:
+
+```text
+active (running)
+```
+
+At this point, the port conflict had been resolved.
+
+But the investigation was not finished.
+
+---
+
+### Step 6: Investigate the Firewall
+
+I returned to the jump host and tested the service again:
+
+```bash
+curl http://stapp01:6400
+```
+
+The request still failed with:
+
+```text
+No route to host
+```
+
+This was an important observation.
+
+Apache was now running, but external traffic was still unable to reach it.
+
+That suggested another layer of the problem: **the firewall**.
+
+I first checked whether `firewalld` was available:
+
+```bash
+sudo firewall-cmd --permanent --add-port=6400/tcp
+```
+
+The server returned:
+
+```text
+sudo: firewall-cmd: command not found
+```
+
+This indicated that `firewalld` was not available on this server.
+
+The system was instead using the older **iptables** firewall system.
+
+---
+
+### Step 7: Configure iptables
+
+I added an inbound rule allowing TCP traffic on port `6400`:
+
+```bash
+sudo iptables -I INPUT -p tcp --dport 6400 -j ACCEPT
+```
+
+Adding the rule allowed incoming connections to Apache.
+
+However, firewall rules should also survive a reboot, so I saved the configuration:
+
+```bash
+sudo service iptables save
+```
+
+This ensured that the new rule would persist.
+
+---
+
+### Step 8: Verify the Fix
+
+The final step was to test the application from the jump host again:
+
+```bash
+curl http://stapp01:6400
+```
+
+This time, the request succeeded and returned the Apache test page HTML.
+
+The issue was completely resolved.
+
+---
+
+## What I Learned
+
+### 1. Troubleshooting Should Be Evidence-Based
+
+The most important lesson was not to immediately assume that the first error represents the root cause.
+
+The initial message looked like a network problem, but the investigation revealed:
+
+```text
+Apache failed
+      ↓
+Port 6400 already occupied
+      ↓
+Sendmail was using the port
+      ↓
+Apache started after Sendmail was stopped
+      ↓
+Firewall still blocked external access
+      ↓
+iptables rule fixed the remaining issue
+```
+
+Each step provided evidence for the next investigation.
+
+### 2. Port Conflicts Are Common Production Problems
+
+Applications need ports to communicate with clients.
+
+If another process is already listening on the required port, the application may fail to start.
+
+The classic error is:
+
+```text
+Address already in use
+```
+
+Whenever I see this message, I should investigate which process owns the port.
+
+### 3. A Running Service Does Not Guarantee Accessibility
+
+After fixing Apache, the service showed:
+
+```text
+active (running)
+```
+
+But the application was still unreachable.
+
+This demonstrated an important DevOps concept:
+
+> **Application health and network accessibility are two different things.**
+
+A service can be running correctly while a firewall prevents clients from reaching it.
+
+### 4. Different Servers Can Use Different Firewall Tools
+
+I initially expected `firewalld`, but the command was unavailable.
+
+The server was using `iptables` instead.
+
+This reinforced the importance of checking the actual environment instead of assuming that every Linux server uses the same tools.
+
+---
+
+## The Layered Troubleshooting Approach
+
+When a service is unreachable, I can use this general process.
+
+### Layer 1 — Is the Service Running?
+
+Check:
+
+```bash
+sudo systemctl status <service>
+```
+
+If the service is failed or inactive, investigate:
+
+```bash
+sudo journalctl -xeu <service>
+```
+
+---
+
+### Layer 2 — Is the Service Listening?
+
+Check active ports:
+
+```bash
+sudo netstat -tulpn
+```
+
+Or search for a specific port:
+
+```bash
+sudo netstat -tulpn | grep <port>
+```
+
+This helps answer:
+
+* Is something listening?
+* Which process owns the port?
+* Is it listening on the expected address?
+* Is another application causing a conflict?
+
+---
+
+### Layer 3 — Is the Firewall Allowing Traffic?
+
+Depending on the system, check the firewall configuration using tools such as:
+
+```bash
+firewall-cmd
+```
+
+or:
+
+```bash
+iptables
+```
+
+A service can be healthy and listening correctly while the firewall still blocks incoming connections.
+
+---
+
+### Layer 4 — Test From the Client
+
+Always test from the actual client or jump host:
+
+```bash
+curl http://<host>:<port>
+```
+
+Testing only from inside the server can give a false impression that everything is working.
+
+---
+
+## Common Mistakes to Avoid
+
+### Stopping After the First Fix
+
+Getting Apache into an `active (running)` state did not mean the entire problem was fixed.
+
+The firewall was still blocking access.
+
+**Lesson:** Always perform an end-to-end verification.
+
+### Assuming the Firewall Technology
+
+I initially expected `firewalld`, but it was not installed.
+
+**Lesson:** Check the server environment before deciding which administration tool to use.
+
+### Ignoring Port Ownership
+
+The Apache failure was caused by another process occupying its port.
+
+**Lesson:** Whenever you see `Address already in use`, immediately investigate the port owner.
+
+### Forgetting Firewall Persistence
+
+Adding an `iptables` rule is not enough if the configuration is not saved.
+
+Without persistence, the rule may disappear after a reboot.
+
+**Lesson:** Make sure important firewall changes are saved according to the system's firewall configuration.
+
+---
+
+## Commands Used
+
+| Command                       | Purpose                                        |
+| ----------------------------- | ---------------------------------------------- |
+| `curl http://<host>:<port>`   | Tests connectivity from a client               |
+| `ssh <user>@<host>`           | Connects to the remote server                  |
+| `systemctl status <service>`  | Checks service status                          |
+| `systemctl start <service>`   | Starts a service                               |
+| `systemctl stop <service>`    | Stops a service                                |
+| `systemctl disable <service>` | Prevents a service from starting automatically |
+| `journalctl -xeu <service>`   | Displays detailed service logs                 |
+| `netstat -tulpn`              | Shows listening ports and associated processes |
+| `firewall-cmd`                | Manages firewalld rules                        |
+| `iptables`                    | Manages Linux firewall rules                   |
+| `service iptables save`       | Saves iptables configuration                   |
+
+---
+
+## Final Takeaway
+
+Day 12 was a great example of how real-world DevOps troubleshooting works.
+
+The problem was not solved by one command. It required following the evidence through multiple layers:
+
+**Service → Port → Process → Firewall → Connectivity**
+
+The biggest lesson I am taking from this exercise is:
+
+> **Don't guess the root cause. Test each layer, follow the evidence, fix the problem, and verify the result from the user's perspective.**
+
+This troubleshooting mindset will be useful when working with Linux servers, web applications, containers, cloud infrastructure, and production environments.
